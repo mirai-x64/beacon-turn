@@ -4,6 +4,13 @@
 
 `index.html` をブラウザで開けば、そのまま始まる。説明もタイトル画面も無い。
 
+> **GitHub Pages はまだ配信できていない。**
+> Pages 有効化 API がこのトークンでは 503 を返し、リポジトリの
+> `default_workflow_permissions` も `read` のままで、いずれもエージェント側の
+> 権限では変えられない。当面は `index.html` をローカルで直接開いて遊ぶこと。
+> 配信するには Settings → Pages で main / (root) を選び、
+> Settings → Actions → General → Workflow permissions を write にする。
+
 ## 操作
 
 **スペースキー、またはタップ / クリック。それだけ。**
