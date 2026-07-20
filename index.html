@@ -1,1 +1,396 @@
-<!doctype html><meta charset=utf-8><title>折り返し灯</title>
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>折り返し灯</title>
+<style>
+  html,body{margin:0;height:100%;background:#05070f;overflow:hidden;
+    touch-action:none;-webkit-user-select:none;user-select:none}
+  body{display:flex;align-items:center;justify-content:center}
+  canvas{display:block;touch-action:none}
+</style>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+
+const W = 900, H = 620;
+
+// --- 霧(ブロック) ---
+const COLS = 8, ROWS = 5, TOTAL = COLS * ROWS;
+const MARGIN = 44, GAP = 8, BW = (W - 2 * MARGIN - GAP * (COLS - 1)) / COLS;
+const BH = 26, ROWGAP = 9, BTOP = 84;
+
+// --- 光の帯(パドル) ---
+// 帯が一点を通過する時間は PW/速度。連打ホバーの振幅は 速度×連打間隔。
+// どちらも同じ比なので、ホバーが効かなくなる終盤の猶予は必然的に ~95ms になる。
+const PW = 110, PH = 13, PY = 568;
+const V0 = 230, VEND = 1160, VCURVE = 1.6;
+
+// --- 船影(ボール) ---
+const BR = 7, BSPEED = 360;
+const MIN_VY = 0.25;      // 水平ループに落ち込ませない
+const SPIN = 0.10;        // 帯の掃く向きがわずかに乗る
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  const dpr = devicePixelRatio || 1;
+  canvas.style.width = W * s + "px";
+  canvas.style.height = H * s + "px";
+  canvas.width = Math.round(W * s * dpr);
+  canvas.height = Math.round(H * s * dpr);
+  ctx.setTransform(s * dpr, 0, 0, s * dpr, 0, 0);
+}
+addEventListener("resize", resize);
+resize();
+
+// ---------------------------------------------------------------- 状態
+
+let blocks, brokenOrder, paddle, ball, mark, state, flash, clearT;
+
+function makeBlocks() {
+  const out = [];
+  for (let r = 0; r < ROWS; r++)
+    for (let c = 0; c < COLS; c++)
+      out.push({
+        x: MARGIN + c * (BW + GAP), y: BTOP + r * (BH + ROWGAP),
+        row: r, alive: true, pop: 0, rise: 0
+      });
+  return out;
+}
+
+// 初手は押さないと必ず落とす配置。ここは固定値で、乱数を混ぜない。
+// 帯は右へ、船影は左へ落ちる。折り返さなければ 460px 離れて着弾する。
+function serveOpening() {
+  paddle = { x: 450, dir: 1 };
+  ball = { x: 450, y: 460, vx: -80, vy: -351 };
+}
+
+function serve() {
+  // 帯の進行方向と逆へ送り、毎回「折り返す」判断を要求する
+  const away = -paddle.dir;
+  const vx = away * (60 + Math.random() * 80);
+  ball = { x: 380 + Math.random() * 140, y: 460, vx,
+           vy: -Math.sqrt(BSPEED * BSPEED - vx * vx) };
+}
+
+function reset() {
+  blocks = makeBlocks();
+  brokenOrder = [];
+  mark = null; flash = 0; clearT = 0;
+  state = "play";
+  serveOpening();
+}
+
+// 速度は「晴れた枚数」から引く。霧が戻れば帯も遅くなる。
+function aliveCount() { let n = 0; for (const b of blocks) if (b.alive) n++; return n; }
+function paddleSpeed() {
+  const t = (TOTAL - aliveCount()) / TOTAL;
+  return V0 + (VEND - V0) * Math.pow(t, VCURVE);
+}
+
+// ---------------------------------------------------------------- 入力
+
+function press() {
+  if (state === "clear") { reset(); return; }
+  paddle.dir = -paddle.dir;   // 移行フレームを挟まない。ここが本体。
+}
+
+addEventListener("keydown", e => {
+  if (e.code === "Space" || e.key === " ") { e.preventDefault(); if (!e.repeat) press(); }
+});
+addEventListener("pointerdown", e => { e.preventDefault(); press(); }, { passive: false });
+
+// 検証用: ?hover=110 で 110ms ごとに自動連打(ホバー可否の測定に使う)
+const hoverMs = parseFloat(new URLSearchParams(location.search).get("hover")) || 0;
+let hoverAcc = 0;
+
+// ---------------------------------------------------------------- 物理
+
+function stepPaddle(dt) {
+  const v = paddleSpeed();
+  paddle.x += paddle.dir * v * dt;
+  const half = PW / 2;
+  if (paddle.x < half) { paddle.x = half; paddle.dir = 1; }
+  if (paddle.x > W - half) { paddle.x = W - half; paddle.dir = -1; }
+}
+
+function normalize() {
+  const s = Math.hypot(ball.vx, ball.vy) || 1;
+  ball.vx = ball.vx / s * BSPEED;
+  ball.vy = ball.vy / s * BSPEED;
+  const min = BSPEED * MIN_VY;
+  if (Math.abs(ball.vy) < min) {
+    ball.vy = (ball.vy < 0 ? -1 : 1) * min;
+    ball.vx = (ball.vx < 0 ? -1 : 1) * Math.sqrt(BSPEED * BSPEED - min * min);
+  }
+}
+
+function hitBlocks() {
+  for (const b of blocks) {
+    if (!b.alive) continue;
+    if (ball.x + BR < b.x || ball.x - BR > b.x + BW) continue;
+    if (ball.y + BR < b.y || ball.y - BR > b.y + BH) continue;
+
+    // 侵入量の浅い軸で跳ね返す
+    const dx = Math.min(ball.x + BR - b.x, b.x + BW - (ball.x - BR));
+    const dy = Math.min(ball.y + BR - b.y, b.y + BH - (ball.y - BR));
+    if (dx < dy) ball.vx = -ball.vx; else ball.vy = -ball.vy;
+
+    b.alive = false; b.pop = 1;
+    brokenOrder.push(b);
+    return;
+  }
+}
+
+function hitPaddle() {
+  if (ball.vy <= 0) return;
+  if (ball.y + BR < PY || ball.y - BR > PY + PH) return;
+  const half = PW / 2;
+  if (ball.x < paddle.x - half - BR || ball.x > paddle.x + half + BR) return;
+
+  let off = (ball.x - paddle.x) / half + SPIN * paddle.dir;
+  off = Math.max(-1, Math.min(1, off));
+  const a = off * (62 * Math.PI / 180);
+  ball.vx = BSPEED * Math.sin(a);
+  ball.vy = -BSPEED * Math.cos(a);
+  ball.y = PY - BR - 0.5;
+}
+
+function miss() {
+  mark = { x: ball.x, px: paddle.x, life: 1 };
+  flash = 1;
+  const b = brokenOrder.pop();   // 霧が一層戻り、帯の速度も戻る
+  if (b) { b.alive = true; b.rise = 1; }
+  serve();
+}
+
+function stepBall(dt) {
+  ball.x += ball.vx * dt;
+  ball.y += ball.vy * dt;
+
+  if (ball.x < BR) { ball.x = BR; ball.vx = Math.abs(ball.vx); }
+  if (ball.x > W - BR) { ball.x = W - BR; ball.vx = -Math.abs(ball.vx); }
+  if (ball.y < BR) { ball.y = BR; ball.vy = Math.abs(ball.vy); }
+
+  hitBlocks();
+  hitPaddle();
+  normalize();
+
+  if (ball.y - BR > H) miss();
+}
+
+function update(dt) {
+  if (hoverMs > 0) {
+    hoverAcc += dt * 1000;
+    while (hoverAcc >= hoverMs) { hoverAcc -= hoverMs; press(); }
+  }
+
+  if (state === "clear") { clearT += dt; return; }
+
+  const steps = 4, h = dt / steps;
+  for (let i = 0; i < steps; i++) { stepPaddle(h); stepBall(h); }
+
+  for (const b of blocks) {
+    if (b.pop > 0) b.pop = Math.max(0, b.pop - dt * 2.6);
+    if (b.rise > 0) b.rise = Math.max(0, b.rise - dt * 1.8);
+  }
+  if (mark) { mark.life -= dt / 1.2; if (mark.life <= 0) mark = null; }
+  if (flash > 0) flash = Math.max(0, flash - dt * 2.2);
+
+  if (aliveCount() === 0) { state = "clear"; clearT = 0; }
+}
+
+// ---------------------------------------------------------------- 描画
+
+function drawSea() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#070c1c");
+  g.addColorStop(0.55, "#0a1226");
+  g.addColorStop(1, "#040711");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.strokeStyle = "rgba(120,170,220,0.05)";
+  ctx.lineWidth = 1;
+  for (let y = 330; y < H; y += 26) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawFog() {
+  for (const b of blocks) {
+    if (!b.alive) {
+      if (b.pop > 0) {   // 晴れた瞬間の残光
+        ctx.globalAlpha = b.pop * 0.5;
+        ctx.strokeStyle = "#cfe6ff";
+        ctx.lineWidth = 2;
+        const e = (1 - b.pop) * 10;
+        roundRect(b.x - e, b.y - e, BW + e * 2, BH + e * 2, 8);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+      continue;
+    }
+    const dens = 0.42 + b.row * 0.11;
+    ctx.globalAlpha = b.rise > 0 ? (1 - b.rise) : 1;
+
+    const g = ctx.createLinearGradient(0, b.y, 0, b.y + BH);
+    g.addColorStop(0, `rgba(206,224,244,${dens})`);
+    g.addColorStop(1, `rgba(150,178,212,${dens * 0.78})`);
+    ctx.fillStyle = g;
+    roundRect(b.x, b.y, BW, BH, 7);
+    ctx.fill();
+
+    ctx.strokeStyle = `rgba(232,244,255,${dens * 0.35})`;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawBeam() {
+  const half = PW / 2, d = paddle.dir;
+  const lead = paddle.x + d * half, tail = paddle.x - d * half;
+  const heat = (paddleSpeed() - V0) / (VEND - V0);
+
+  ctx.save();
+  ctx.shadowColor = "rgba(255,206,128,0.95)";
+  ctx.shadowBlur = 18 + heat * 26;
+
+  // 進行方向へ向かって明るくなる = どちらへ走っているかが一目で分かる
+  const g = ctx.createLinearGradient(tail, 0, lead, 0);
+  g.addColorStop(0, "rgba(255,178,86,0.20)");
+  g.addColorStop(0.55, `rgba(255,206,132,${0.80 + heat * 0.18})`);
+  g.addColorStop(1, "#fff6e0");
+  ctx.fillStyle = g;
+  roundRect(paddle.x - half, PY, PW, PH, PH / 2);
+  ctx.fill();
+  ctx.restore();
+
+  // 先端の芯
+  const cw = 16, cx = d > 0 ? lead - cw : lead;
+  ctx.fillStyle = "rgba(255,252,240,0.92)";
+  roundRect(cx, PY + 3, cw, PH - 6, (PH - 6) / 2);
+  ctx.fill();
+}
+
+function drawShip() {
+  ctx.save();
+  ctx.shadowColor = "rgba(255,236,190,0.7)";
+  ctx.shadowBlur = 12;
+  ctx.fillStyle = "#0d1424";
+  ctx.beginPath();
+  ctx.arc(ball.x, ball.y, BR, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = "rgba(214,232,255,0.85)";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.restore();
+  ctx.fillStyle = "#ffdf9a";       // 船の灯
+  ctx.beginPath();
+  ctx.arc(ball.x, ball.y - 1.5, 2.1, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// 落とした一撃の「どちらへどれだけ行き過ぎたか」を線で残す。文字では説明しない。
+function drawMark() {
+  if (!mark) return;
+  ctx.globalAlpha = mark.life;
+  ctx.strokeStyle = "rgba(255,120,120,0.9)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(mark.x, PY - 12); ctx.lineTo(mark.x, PY + PH + 12);
+  ctx.stroke();
+
+  ctx.setLineDash([5, 5]);
+  ctx.strokeStyle = "rgba(255,150,150,0.55)";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(mark.x, PY + PH / 2); ctx.lineTo(mark.px, PY + PH / 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  ctx.strokeStyle = "rgba(255,190,140,0.7)";
+  roundRect(mark.px - PW / 2, PY, PW, PH, PH / 2);
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+function drawFlash() {
+  if (flash <= 0) return;
+  const g = ctx.createLinearGradient(0, H - 70, 0, H);
+  g.addColorStop(0, "rgba(255,60,60,0)");
+  g.addColorStop(1, `rgba(255,60,60,${flash * 0.4})`);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, H - 70, W, 70);
+}
+
+function drawClear() {
+  ctx.fillStyle = `rgba(4,7,17,${Math.min(0.72, clearT * 1.2)})`;
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalAlpha = Math.min(1, clearT * 1.6);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#ffe9b8";
+  ctx.font = "600 52px system-ui,'Hiragino Sans','Noto Sans JP',sans-serif";
+  ctx.fillText("霧が晴れた", W / 2, H / 2 - 6);
+  ctx.fillStyle = "rgba(200,216,240,0.55)";
+  ctx.font = "300 18px system-ui,'Hiragino Sans','Noto Sans JP',sans-serif";
+  ctx.fillText("押すと、また沖が曇る", W / 2, H / 2 + 38);
+  ctx.globalAlpha = 1;
+}
+
+function draw() {
+  drawSea();
+  drawFog();
+  drawMark();
+  drawBeam();
+  drawShip();
+  drawFlash();
+  if (state === "clear") drawClear();
+}
+
+// ---------------------------------------------------------------- ループ
+
+let last = 0;
+function frame(t) {
+  if (!last) last = t;
+  const dt = Math.min(0.05, (t - last) / 1000);
+  last = t;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+
+reset();
+requestAnimationFrame(frame);
+
+// 検証用フック
+window.__game = {
+  get speed() { return paddleSpeed(); },
+  get alive() { return aliveCount(); },
+  get paddle() { return paddle; },
+  get ball() { return ball; },
+  get state() { return state; },
+  press, reset,
+  clearAllBut(n) {   // 終盤状態を直接作って計測するため
+    for (const b of blocks) { b.alive = false; b.pop = 0; }
+    let k = 0;
+    for (const b of blocks) { if (k++ < n) { b.alive = true; } }
+    brokenOrder = blocks.filter(b => !b.alive);
+  }
+};
+</script>
+</html>
